@@ -1,0 +1,110 @@
+name: Validate Data Points
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+    paths:
+      - 'data_points/**'
+
+jobs:
+  validate:
+    name: Validate Modified Data Points
+    runs-on: ubuntu-latest
+    permissions:
+      pull-requests: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.ACTION_TOKEN_ACCESS }}
+
+      - name: Set up Python 3.10
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Install uv package manager
+        run: |
+          curl -LsSf https://astral.sh/uv/install.sh | sh
+
+      - name: Add uv to PATH
+        shell: bash
+        run: echo "${HOME}/.cargo/bin" >> $GITHUB_PATH
+
+      - name: Sync dependencies using uv
+        run: uv sync
+
+      - name: Get list of changed data point files from PR
+        id: get_changed_files
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        with:
+          result-encoding: string
+          script: |
+            const prNumber = context.payload.pull_request.number;
+            const files = await github.paginate(
+              github.rest.pulls.listFiles,
+              {
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                pull_number: prNumber,
+                per_page: 100
+              }
+            );
+
+            const changed = files
+              .map(f => f.filename)
+              .filter(name => name.startsWith("data_points/") && name.endsWith(".json"))
+              .map(name => name.replace(/^data_points\//, "").replace(/\.json$/, ""));
+
+            core.setOutput("file_names", changed.join(" "));
+
+      - name: Run validator on changed files
+        if: steps.get_changed_files.outputs.file_names != ''
+        run: |
+          echo "Running validation on:"
+          echo "${{ steps.get_changed_files.outputs.file_names }}"
+          
+          set -o pipefail && \
+          python data_points_validator.py \
+            --data-dir data_points \
+            --files ${{ steps.get_changed_files.outputs.file_names }} \
+            | tee validation_output.log
+
+      - name: Report success
+        if: success()
+        run: echo "✅ All modified data points passed validation."
+
+      - name: Report failure
+        if: failure()
+        run: |
+          echo "❌ Validation failed. See logs below:"
+          echo ""
+          echo "═════════════ validator log ═════════════"
+          cat validation_output.log || echo "⚠️ No output log found"
+          echo "═════════════════════════════════════════"
+
+      - name: Comment on PR (success)
+        if: success() && github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: "✅ **Validation passed**: All modified data points are valid!"
+            })
+
+      - name: Comment on PR (failure)
+        if: failure() && github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: "❌ **Validation failed**: One or more data points are invalid.\nPlease check the workflow logs for detailed information."
+            })
